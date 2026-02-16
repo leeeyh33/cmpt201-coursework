@@ -1,0 +1,127 @@
+#include "parser.h"
+#include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
+
+void parsed_command_init(ParsedCommand *pc) {
+  pc->argv = NULL;
+  pc->argc = 0;
+  pc->background = false;
+}
+
+void parsed_command_destroy(ParsedCommand *pc) {
+  if (!pc)
+    return;
+  if (pc->argv) {
+    for (int i = 0; i < pc->argc; i++)
+      free(pc->argv[i]);
+    free(pc->argv);
+  }
+  pc->argv = NULL;
+  pc->argc = 0;
+  pc->background = false;
+}
+
+static char *strndup_local(const char *s, size_t n) {
+  char *p = malloc(n + 1);
+  if (!p)
+    return NULL;
+  memcpy(p, s, n);
+  p[n] = '\0';
+  return p;
+}
+
+static void rtrim_spaces(char *s) {
+  size_t len = strlen(s);
+  while (len > 0 && isspace((unsigned char)s[len - 1])) {
+    s[len - 1] = '\0';
+    len--;
+  }
+}
+
+int parse_command_line(const char *line, ParsedCommand *out) {
+  parsed_command_init(out);
+  if (!line)
+    return 0;
+
+  char *buf = strdup(line);
+  if (!buf)
+    return -1;
+
+  char *p = buf;
+  while (*p && isspace((unsigned char)*p))
+    p++;
+
+  rtrim_spaces(p);
+
+  size_t len = strlen(p);
+  if (len > 0 && p[len - 1] == '&') {
+    out->background = true;
+    p[len - 1] = '\0';
+    rtrim_spaces(p);
+  }
+
+  if (*p == '\0') {
+    free(buf);
+    return 0;
+  }
+
+  int cap = 8;
+  out->argv = calloc(cap, sizeof(char *));
+  if (!out->argv) {
+    free(buf);
+    return -1;
+  }
+
+  const char *s = p;
+  while (*s) {
+    while (*s && isspace((unsigned char)*s))
+      s++;
+    if (!*s)
+      break;
+
+    char *token = NULL;
+
+    if (*s == '"') {
+      s++;
+      const char *start = s;
+      while (*s && *s != '"')
+        s++;
+      if (*s != '"') {
+        token = strdup(start);
+      } else {
+        token = strndup_local(start, s - start);
+        s++;
+      }
+    } else {
+      const char *start = s;
+      while (*s && !isspace((unsigned char)*s))
+        s++;
+      token = strndup_local(start, s - start);
+    }
+
+    if (!token) {
+      parsed_command_destroy(out);
+      free(buf);
+      return -1;
+    }
+
+    if (out->argc + 2 > cap) {
+      cap *= 2;
+      char **newv = realloc(out->argv, cap * sizeof(char *));
+      if (!newv) {
+        free(token);
+        parsed_command_destroy(out);
+        free(buf);
+        return -1;
+      }
+      out->argv = newv;
+    }
+
+    out->argv[out->argc++] = token;
+    out->argv[out->argc] = NULL;
+  }
+
+  free(buf);
+  return 0;
+}

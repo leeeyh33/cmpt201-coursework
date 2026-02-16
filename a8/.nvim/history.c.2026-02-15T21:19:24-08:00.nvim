@@ -1,0 +1,96 @@
+#include "history.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static void entry_free(HistoryEntry *e) {
+  if (e->cmd)
+    free(e->cmd);
+  e->cmd = NULL;
+  e->number = 0;
+}
+
+void history_init(History *h) {
+  h->count = 0;
+  h->start = 0;
+  h->next_number = 0;
+  for (int i = 0; i < HISTORY_CAP; i++) {
+    h->entries[i].cmd = NULL;
+    h->entries[i].number = 0;
+  }
+}
+
+void history_destroy(History *h) {
+  for (int i = 0; i < HISTORY_CAP; i++) {
+    entry_free(&h->entries[i]);
+  }
+}
+
+void history_add(History *h, const char *cmdline) {
+  if (!cmdline)
+    return;
+
+  int idx;
+  if (h->count < HISTORY_CAP) {
+    idx = (h->start + h->count) % HISTORY_CAP;
+    h->count++;
+  } else {
+    idx = h->start;
+    entry_free(&h->entries[idx]);
+    h->start = (h->start + 1) % HISTORY_CAP;
+  }
+
+  h->entries[idx].number = h->next_number++;
+  h->entries[idx].cmd = strdup(cmdline);
+  if (!h->entries[idx].cmd) {
+    h->entries[idx].cmd = NULL;
+  }
+}
+
+static int newest_index(const History *h) {
+  if (h->count == 0)
+    return -1;
+  return (h->start + h->count - 1) % HISTORY_CAP;
+}
+
+void history_print(const History *h) {
+  for (int i = 0; i < h->count; i++) {
+    int idx = newest_index(h) - i;
+    while (idx < 0)
+      idx += HISTORY_CAP;
+    const HistoryEntry *e = &h->entries[idx];
+    if (e->cmd) {
+      printf("%ld\t%s\n", e->number, e->cmd);
+    }
+  }
+}
+
+bool history_get_by_number(const History *h, long n, const char **out_cmd) {
+  if (h->count == 0)
+    return false;
+
+  long newest = h->entries[newest_index(h)].number;
+  long oldest = newest - (h->count - 1);
+
+  if (n < oldest || n > newest)
+    return false;
+
+  for (int i = 0; i < h->count; i++) {
+    int idx = (h->start + i) % HISTORY_CAP;
+    if (h->entries[idx].cmd && h->entries[idx].number == n) {
+      *out_cmd = h->entries[idx].cmd;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool history_get_last(const History *h, const char **out_cmd) {
+  int idx = newest_index(h);
+  if (idx < 0)
+    return false;
+  if (!h->entries[idx].cmd)
+    return false;
+  *out_cmd = h->entries[idx].cmd;
+  return true;
+}

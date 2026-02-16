@@ -1,0 +1,378 @@
+#include "shell.h"
+#include "history.h"
+#include "msgs.h"
+#include "parser.h"
+
+#include <errno.h>
+#include <pwd.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define INBUF_SIZE 4096
+#define PROMPT_SIZE 4096
+
+static char g_prompt[PROMPT_SIZE];
+
+static void write_all(int fd, const char *s) {
+  size_t n = strlen(s);
+  while (n > 0) {
+    ssize_t w = write(fd, s, n);
+    if (w < 0) {
+      if (errno == EINTR)
+        continue;
+      return;
+    }
+    s += (size_t)w;
+    n -= (size_t)w;
+  }
+}
+
+static void build_prompt(void) {
+  char cwd[PROMPT_SIZE - 2];
+  if (!getcwd(cwd, sizeof(cwd))) {
+    fprintf(stderr, "shell: unable to get current directory\n");
+    snprintf(g_prompt, sizeof(g_prompt), "$");
+    return;
+  }
+  snprintf(g_prompt, sizeof(g_prompt), "%s$", cwd);
+}
+
+static void print_prompt(void) { write_all(STDOUT_FILENO, g_prompt); }
+
+static void print_help_stdout(void) {
+  printf("exit: exit the shell\n");
+  printf("pwd: print the current working directory\n");
+  printf("cd: change the current directory\n");
+  printf("help: show help information\n");
+  printf("history: show command history\n");
+  fflush(stdout);
+}
+
+static void print_help_signal_safe(void) {
+  write_all(STDOUT_FILENO, "exit: exit the shell\n");
+  write_all(STDOUT_FILENO, "pwd: print the current working directory\n");
+  write_all(STDOUT_FILENO, "cd: change the current directory\n");
+  write_all(STDOUT_FILENO, "help: show help information\n");
+  write_all(STDOUT_FILENO, "history: show command history\n");
+}
+
+static void sigint_handler(int signo) {
+  (void)signo;
+  write_all(STDOUT_FILENO, "\n");
+  print_help_signal_safe();
+  write_all(STDOUT_FILENO, g_prompt);
+}
+
+static void reap_zombies(void) {
+  int status;
+  while (1) {
+    pid_t p = waitpid(-1, &status, WNOHANG);
+    if (p > 0)
+      continue;
+    if (p == 0)
+      break;
+    if (p < 0) {
+      if (errno == EINTR)
+        continue;
+      break;
+    }
+  }
+}
+
+static const char *get_home_dir(void) {
+  const char *h = getenv("HOME");
+  if (h && *h)
+    return h;
+  struct passwd *pw = getpwuid(getuid());
+  if (pw && pw->pw_dir)
+    return pw->pw_dir;
+  return NULL;
+}
+
+static int do_pwd(ParsedCommand *pc) {
+  if (pc->argc > 1) {
+    fprintf(stderr, "pwd: too many arguments\n");
+    return 0;
+  }
+  char cwd[PROMPT_SIZE];
+  if (!getcwd(cwd, sizeof(cwd))) {
+    fprintf(stderr, "pwd: unable to get current directory\n");
+    return 0;
+  }
+  printf("%s\n", cwd);
+  return 0;
+}
+
+static int do_cd(ParsedCommand *pc, char *prev_dir, size_t prev_sz) {
+  if (pc->argc > 2) {
+    fprintf(stderr, "cd: too many arguments\n");
+    return 0;
+  }
+
+  char old[PROMPT_SIZE];
+  if (!getcwd(old, sizeof(old)))
+    old[0] = '\0';
+
+  const char *target = NULL;
+  char *expanded = NULL;
+
+  if (pc->argc == 1) {
+    target = get_home_dir();
+    if (!target) {
+      fprintf(stderr, "cd: unable to change directory\n");
+      return 0;
+    }
+  } else {
+    const char *arg = pc->argv[1];
+    if (strcmp(arg, "-") == 0) {
+      if (prev_dir[0] == '\0') {
+        fprintf(stderr, "cd: unable to change directory\n");
+        return 0;
+      }
+      target = prev_dir;
+    } else if (arg[0] == '~') {
+      const char *home = get_home_dir();
+      if (!home) {
+        fprintf(stderr, "cd: unable to change directory\n");
+        return 0;
+      }
+      expanded = (char *)malloc(strlen(home) + strlen(arg));
+      if (!expanded) {
+        fprintf(stderr, "cd: unable to change directory\n");
+        return 0;
+      }
+      strcpy(expanded, home);
+      strcat(expanded, arg + 1);
+      target = expanded;
+    } else {
+      target = arg;
+    }
+  }
+
+  if (chdir(target) != 0) {
+    fprintf(stderr, "cd: unable to change directory\n");
+    free(expanded);
+    return 0;
+  }
+
+  if (old[0] != '\0')
+    snprintf(prev_dir, prev_sz, "%s", old);
+  free(expanded);
+  return 0;
+}
+
+static int do_help(ParsedCommand *pc) {
+  if (pc->argc > 2) {
+    fprintf(stderr, "help: too many arguments\n");
+    return 0;
+  }
+  if (pc->argc == 1) {
+    print_help_stdout();
+    return 0;
+  }
+
+  const char *arg = pc->argv[1];
+  if (strcmp(arg, "exit") == 0)
+    printf("exit: exit the shell\n");
+  else if (strcmp(arg, "pwd") == 0)
+    printf("pwd: print the current working directory\n");
+  else if (strcmp(arg, "cd") == 0)
+    printf("cd: change the current directory\n");
+  else if (strcmp(arg, "help") == 0)
+    printf("help: show help information\n");
+  else if (strcmp(arg, "history") == 0)
+    printf("history: show command history\n");
+  else
+    printf("%s: external command or application\n", arg);
+
+  return 0;
+}
+
+static int run_external(ParsedCommand *pc) {
+  pid_t pid = fork();
+  if (pid < 0) {
+    fprintf(stderr, "shell: unable to fork\n");
+    return 0;
+  }
+
+  if (pid == 0) {
+    execvp(pc->argv[0], pc->argv);
+    fprintf(stderr, "shell: unable to execute command\n");
+    _exit(127);
+  }
+
+  if (pc->background)
+    return 0;
+
+  int status;
+  while (1) {
+    pid_t w = waitpid(pid, &status, 0);
+    if (w == pid)
+      break;
+    if (w < 0) {
+      if (errno == EINTR)
+        continue;
+      fprintf(stderr, "shell: unable to wait for child\n");
+      break;
+    }
+  }
+  return 0;
+}
+
+static int execute_line(const char *cmdline, History *hist, char *prev_dir,
+                        size_t prev_sz) {
+  ParsedCommand pc;
+  if (parse_command_line(cmdline, &pc) < 0)
+    return 0;
+
+  if (pc.argc == 0) {
+    parsed_command_destroy(&pc);
+    return 0;
+  }
+
+  if (strcmp(pc.argv[0], "exit") == 0) {
+    if (pc.argc > 1) {
+      fprintf(stderr, "exit: too many arguments\n");
+      parsed_command_destroy(&pc);
+      return 0;
+    }
+    parsed_command_destroy(&pc);
+    return 1;
+  }
+
+  if (strcmp(pc.argv[0], "pwd") == 0) {
+    do_pwd(&pc);
+    parsed_command_destroy(&pc);
+    return 0;
+  }
+
+  if (strcmp(pc.argv[0], "cd") == 0) {
+    do_cd(&pc, prev_dir, prev_sz);
+    parsed_command_destroy(&pc);
+    return 0;
+  }
+
+  if (strcmp(pc.argv[0], "help") == 0) {
+    do_help(&pc);
+    parsed_command_destroy(&pc);
+    return 0;
+  }
+
+  if (strcmp(pc.argv[0], "history") == 0) {
+    if (pc.argc > 1) {
+      fprintf(stderr, "history: too many arguments\n");
+    } else {
+      history_print(hist);
+    }
+    parsed_command_destroy(&pc);
+    return 0;
+  }
+
+  run_external(&pc);
+  parsed_command_destroy(&pc);
+  return 0;
+}
+
+static int is_all_digits(const char *s) {
+  if (!s || !*s)
+    return 0;
+  for (; *s; s++)
+    if (*s < '0' || *s > '9')
+      return 0;
+  return 1;
+}
+
+int shell_run(void) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = sigint_handler;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGINT, &sa, NULL);
+
+  History hist;
+  history_init(&hist);
+
+  char prev_dir[PROMPT_SIZE];
+  prev_dir[0] = '\0';
+
+  char inbuf[INBUF_SIZE];
+
+  while (1) {
+    reap_zombies();
+    build_prompt();
+    print_prompt();
+
+    ssize_t n = read(STDIN_FILENO, inbuf, sizeof(inbuf) - 1);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      fprintf(stderr, "shell: unable to read command\n");
+      continue;
+    }
+    if (n == 0)
+      break;
+
+    inbuf[n] = '\0';
+    while (n > 0 && (inbuf[n - 1] == '\n' || inbuf[n - 1] == '\r'))
+      inbuf[--n] = '\0';
+
+    char *line = inbuf;
+    while (*line == ' ' || *line == '\t')
+      line++;
+    if (*line == '\0')
+      continue;
+
+    if (line[0] == '!') {
+      if (strcmp(line, "!!") == 0) {
+        const char *cmd;
+        if (!history_get_last(&hist, &cmd)) {
+          fprintf(stderr, "history: no command entered\n");
+          continue;
+        }
+        printf("%s\n", cmd);
+        fflush(stdout);
+        history_add(&hist, cmd);
+        if (execute_line(cmd, &hist, prev_dir, sizeof(prev_dir)))
+          break;
+        continue;
+      }
+
+      const char *numstr = line + 1;
+      if (!is_all_digits(numstr)) {
+        fprintf(stderr, "history: command invalid\n");
+        continue;
+      }
+
+      errno = 0;
+      long val = strtol(numstr, NULL, 10);
+      if (errno != 0) {
+        fprintf(stderr, "history: command invalid\n");
+        continue;
+      }
+
+      const char *cmd;
+      if (!history_get_by_number(&hist, val, &cmd)) {
+        fprintf(stderr, "history: command invalid\n");
+        continue;
+      }
+
+      printf("%s\n", cmd);
+      fflush(stdout);
+      history_add(&hist, cmd);
+      if (execute_line(cmd, &hist, prev_dir, sizeof(prev_dir)))
+        break;
+      continue;
+    }
+
+    history_add(&hist, line);
+    if (execute_line(line, &hist, prev_dir, sizeof(prev_dir)))
+      break;
+  }
+
+  history_destroy(&hist);
+  return 0;
+}

@@ -1,0 +1,38 @@
+cmake_minimum_required(VERSION 3.14)
+
+project(a8 C CXX)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+include_directories(include)
+
+add_library(shell_lib
+  src/shell.c
+  src/history.c
+  src/parser.c
+)
+
+add_executable(shell
+  src/main.c
+)
+target_link_libraries(shell shell_lib)
+
+include(FetchContent)
+FetchContent_Declare(
+  googletest
+  DOWNLOAD_EXTRACT_TIMESTAMP false
+  URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+)
+FetchContent_MakeAvailable(googletest)
+
+enable_testing()
+
+add_executable(shell_test gtest/shell_test.cpp)
+target_link_libraries(shell_test GTest::gtest_main shell_lib)
+
+include(GoogleTest)
+gtest_discover_tests(shell_test)
