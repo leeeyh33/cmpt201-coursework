@@ -1,0 +1,289 @@
+#include "server.h"
+
+client_t clients[MAX_CLIENTS];
+int expected_clients = 0;
+int finished_clients = 0;
+pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+message_node_t *queue_head = NULL;
+message_node_t *queue_tail = NULL;
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+
+static int shutdown_flag = 0;
+
+ssize_t send_all(int fd, const void *buf, size_t len) {
+  size_t total = 0;
+  const char *p = (const char *)buf;
+
+  while (total < len) {
+    ssize_t n = send(fd, p + total, len - total, 0);
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return -1;
+    }
+    if (n == 0) {
+      return -1;
+    }
+    total += (size_t)n;
+  }
+
+  return (ssize_t)total;
+}
+
+ssize_t recv_message(int fd, char *buf, size_t max_len) {
+  size_t total = 0;
+
+  while (total < max_len) {
+    ssize_t n = recv(fd, buf + total, 1, 0);
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return -1;
+    }
+    if (n == 0) {
+      return 0;
+    }
+    total += (size_t)n;
+    if (buf[total - 1] == '\n') {
+      return (ssize_t)total;
+    }
+  }
+
+  return -1;
+}
+
+void enqueue_message(const char *data, size_t len) {
+  message_node_t *node = malloc(sizeof(message_node_t));
+  if (node == NULL) {
+    exit(EXIT_FAILURE);
+  }
+
+  memcpy(node->data, data, len);
+  node->len = len;
+  node->next = NULL;
+
+  pthread_mutex_lock(&queue_mutex);
+  if (queue_tail == NULL) {
+    queue_head = node;
+    queue_tail = node;
+  } else {
+    queue_tail->next = node;
+    queue_tail = node;
+  }
+  pthread_cond_signal(&queue_cond);
+  pthread_mutex_unlock(&queue_mutex);
+}
+
+message_node_t *dequeue_message(void) {
+  message_node_t *node = NULL;
+
+  pthread_mutex_lock(&queue_mutex);
+  while (queue_head == NULL) {
+    pthread_cond_wait(&queue_cond, &queue_mutex);
+  }
+
+  node = queue_head;
+  queue_head = queue_head->next;
+  if (queue_head == NULL) {
+    queue_tail = NULL;
+  }
+  pthread_mutex_unlock(&queue_mutex);
+
+  return node;
+}
+
+void *broadcast_thread(void *arg) {
+  (void)arg;
+
+  while (1) {
+    message_node_t *node = dequeue_message();
+    if (node == NULL) {
+      continue;
+    }
+
+    int fds[MAX_CLIENTS];
+    int count = 0;
+
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < expected_clients; i++) {
+      if (clients[i].active) {
+        fds[count++] = clients[i].fd;
+      }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+
+    for (int i = 0; i < count; i++) {
+      send_all(fds[i], node->data, node->len);
+    }
+
+    if ((uint8_t)node->data[0] == 1) {
+      free(node);
+      shutdown_flag = 1;
+      break;
+    }
+
+    free(node);
+  }
+
+  return NULL;
+}
+
+void *client_thread(void *arg) {
+  int index = *(int *)arg;
+  free(arg);
+
+  char buf[MAX_MESSAGE_SIZE + 1];
+
+  while (1) {
+    ssize_t n = recv_message(clients[index].fd, buf, MAX_MESSAGE_SIZE);
+    if (n <= 0) {
+      pthread_mutex_lock(&clients_mutex);
+      clients[index].active = 0;
+      pthread_mutex_unlock(&clients_mutex);
+      close(clients[index].fd);
+      return NULL;
+    }
+
+    if ((uint8_t)buf[0] == 0) {
+      char out[MAX_MESSAGE_SIZE + 1];
+      size_t out_len = 1 + sizeof(uint32_t) + sizeof(uint16_t) + ((size_t)n - 1);
+
+      if (out_len > MAX_MESSAGE_SIZE) {
+        pthread_mutex_lock(&clients_mutex);
+        clients[index].active = 0;
+        pthread_mutex_unlock(&clients_mutex);
+        close(clients[index].fd);
+        return NULL;
+      }
+
+      out[0] = 0;
+      memcpy(out + 1, &clients[index].addr.sin_addr.s_addr, sizeof(uint32_t));
+      memcpy(out + 1 + sizeof(uint32_t), &clients[index].addr.sin_port,
+             sizeof(uint16_t));
+      memcpy(out + 1 + sizeof(uint32_t) + sizeof(uint16_t), buf + 1,
+             (size_t)n - 1);
+
+      enqueue_message(out, out_len);
+    } else if ((uint8_t)buf[0] == 1) {
+      int should_finish = 0;
+
+      pthread_mutex_lock(&clients_mutex);
+      if (!clients[index].finished) {
+        clients[index].finished = 1;
+        finished_clients++;
+        if (finished_clients == expected_clients) {
+          should_finish = 1;
+        }
+      }
+      pthread_mutex_unlock(&clients_mutex);
+
+      if (should_finish) {
+        char end_msg[2];
+        end_msg[0] = 1;
+        end_msg[1] = '\n';
+        enqueue_message(end_msg, 2);
+      }
+
+      return NULL;
+    }
+  }
+}
+
+int main(int argc, char *argv[]) {
+  if (argc != 3) {
+    return EXIT_FAILURE;
+  }
+
+  int port = atoi(argv[1]);
+  expected_clients = atoi(argv[2]);
+
+  if (expected_clients <= 0 || expected_clients > MAX_CLIENTS) {
+    return EXIT_FAILURE;
+  }
+
+  int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (server_fd < 0) {
+    return EXIT_FAILURE;
+  }
+
+  int opt = 1;
+  if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+    close(server_fd);
+    return EXIT_FAILURE;
+  }
+
+  struct sockaddr_in server_addr;
+  memset(&server_addr, 0, sizeof(server_addr));
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  server_addr.sin_port = htons((uint16_t)port);
+
+  if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+    close(server_fd);
+    return EXIT_FAILURE;
+  }
+
+  if (listen(server_fd, expected_clients) < 0) {
+    close(server_fd);
+    return EXIT_FAILURE;
+  }
+
+  pthread_t broadcaster;
+  if (pthread_create(&broadcaster, NULL, broadcast_thread, NULL) != 0) {
+    close(server_fd);
+    return EXIT_FAILURE;
+  }
+
+  pthread_t client_threads[MAX_CLIENTS];
+
+  for (int i = 0; i < expected_clients; i++) {
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+
+    int client_fd =
+        accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+    if (client_fd < 0) {
+      close(server_fd);
+      return EXIT_FAILURE;
+    }
+
+    clients[i].fd = client_fd;
+    clients[i].addr = client_addr;
+    clients[i].active = 1;
+    clients[i].finished = 0;
+
+    int *index = malloc(sizeof(int));
+    if (index == NULL) {
+      close(client_fd);
+      close(server_fd);
+      return EXIT_FAILURE;
+    }
+    *index = i;
+
+    if (pthread_create(&client_threads[i], NULL, client_thread, index) != 0) {
+      free(index);
+      close(client_fd);
+      close(server_fd);
+      return EXIT_FAILURE;
+    }
+  }
+
+  pthread_join(broadcaster, NULL);
+
+  for (int i = 0; i < expected_clients; i++) {
+    pthread_join(client_threads[i], NULL);
+  }
+
+  for (int i = 0; i < expected_clients; i++) {
+    if (clients[i].fd >= 0) {
+      close(clients[i].fd);
+    }
+  }
+
+  close(server_fd);
+
+  return EXIT_SUCCESS;
+}
