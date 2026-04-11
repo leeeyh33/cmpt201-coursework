@@ -1,0 +1,160 @@
+#include "blockchain.h"
+
+#include <openssl/evp.h>
+#include <openssl/sha.h>
+#include <stdint.h>
+#include <string.h>
+#include <time.h>
+
+static int compute_hash(const struct block_core *core,
+                        unsigned char out[SHA256_DIGEST_LENGTH]) {
+  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+  unsigned int out_len = 0;
+  int ret = -1;
+
+  if (ctx == NULL) {
+    return -1;
+  }
+
+  if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1) {
+    goto cleanup;
+  }
+
+  if (EVP_DigestUpdate(ctx, core, sizeof(struct block_core)) != 1) {
+    goto cleanup;
+  }
+
+  if (EVP_DigestFinal_ex(ctx, out, &out_len) != 1) {
+    goto cleanup;
+  }
+
+  if (out_len != SHA256_DIGEST_LENGTH) {
+    goto cleanup;
+  }
+
+  ret = 0;
+
+cleanup:
+  EVP_MD_CTX_free(ctx);
+  return ret;
+}
+
+static int hash_cmp(const unsigned char a[SHA256_DIGEST_LENGTH],
+                    const unsigned char b[SHA256_DIGEST_LENGTH]) {
+  for (size_t i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+    if (a[i] < b[i]) {
+      return -1;
+    }
+    if (a[i] > b[i]) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int bc_init(struct blockchain *bc,
+            unsigned char difficulty[SHA256_DIGEST_LENGTH]) {
+  if (bc == NULL || difficulty == NULL) {
+    return -1;
+  }
+
+  memset(bc, 0, sizeof(struct blockchain));
+  memcpy(bc->difficulty, difficulty, SHA256_DIGEST_LENGTH);
+
+  return 0;
+}
+
+int bc_add_block(struct blockchain *bc, const unsigned char data[DATA_SIZE]) {
+  struct block new_block;
+
+  if (bc == NULL || data == NULL) {
+    return -1;
+  }
+
+  if (bc->count >= BLOCKCHAIN_SIZE) {
+    return -1;
+  }
+
+  memset(&new_block, 0, sizeof(struct block));
+
+  new_block.core.index = bc->count;
+
+  if (clock_gettime(CLOCK_REALTIME, &new_block.core.timestamp) != 0) {
+    return -1;
+  }
+
+  memcpy(new_block.core.data, data, DATA_SIZE);
+
+  if (bc->count == 0) {
+    memset(new_block.core.p_hash, 0, SHA256_DIGEST_LENGTH);
+  } else {
+    memcpy(new_block.core.p_hash, bc->blocks[bc->count - 1].hash,
+           SHA256_DIGEST_LENGTH);
+  }
+
+  new_block.core.nonce = 0;
+
+  while (1) {
+    if (compute_hash(&new_block.core, new_block.hash) != 0) {
+      return -1;
+    }
+
+    if (hash_cmp(new_block.hash, bc->difficulty) <= 0) {
+      break;
+    }
+
+    if (new_block.core.nonce == UINT32_MAX) {
+      return -1;
+    }
+
+    new_block.core.nonce++;
+  }
+
+  bc->blocks[bc->count] = new_block;
+  bc->count++;
+
+  return 0;
+}
+
+int bc_verify(struct blockchain *bc) {
+  unsigned char expected_hash[SHA256_DIGEST_LENGTH];
+  unsigned char zero_hash[SHA256_DIGEST_LENGTH];
+
+  if (bc == NULL) {
+    return -1;
+  }
+
+  memset(zero_hash, 0, SHA256_DIGEST_LENGTH);
+
+  for (size_t i = 0; i < bc->count; i++) {
+    if (bc->blocks[i].core.index != i) {
+      return -1;
+    }
+
+    if (compute_hash(&bc->blocks[i].core, expected_hash) != 0) {
+      return -1;
+    }
+
+    if (memcmp(expected_hash, bc->blocks[i].hash, SHA256_DIGEST_LENGTH) != 0) {
+      return -1;
+    }
+
+    if (hash_cmp(bc->blocks[i].hash, bc->difficulty) > 0) {
+      return -1;
+    }
+
+    if (i == 0) {
+      if (memcmp(bc->blocks[i].core.p_hash, zero_hash,
+                 SHA256_DIGEST_LENGTH) != 0) {
+        return -1;
+      }
+    } else {
+      if (memcmp(bc->blocks[i].core.p_hash, bc->blocks[i - 1].hash,
+                 SHA256_DIGEST_LENGTH) != 0) {
+        return -1;
+      }
+    }
+  }
+
+  return 0;
+}
